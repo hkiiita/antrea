@@ -1,0 +1,20 @@
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: lfx-test-np
+  namespace: lfx-mentorship
+spec:
+  priority: 1
+  appliedTo:
+    - podSelector: {}
+  egress:
+    - action: Allow
+      to:
+        - namespaceSelector: {}
+      name: AllowTrafficToAllPodsInAllNamespaces
+    - action: Allow
+      to:
+        - fqdn: "api.github.com"
+      name: AllowForFQDN
+    - action: Reject
+      name: DropAllRemainingTraffic

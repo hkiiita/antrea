@@ -1,0 +1,10 @@
+I0816 13:49:55.134061       1 log_file.go:93] Set log file max size to 104857600
+I0816 13:49:55.134552       1 controller.go:125] "LFX Mentorship 2024_03 test task #6590 log" Github username="hkiiita" Pod name ="antrea-controller-6589f6db9-jzjjz"
+I0816 13:49:55.134580       1 controller.go:126] "Starting Antrea Controller" version="v2.2.0-dev-7d8d4b1e.dirty"
+I0816 13:49:55.134590       1 client.go:89] No kubeconfig file was specified. Falling back to in-cluster config
+I0816 13:49:55.143464       1 selfsignedcert_provider.go:298] "Didn't find the Secret for TLS certificate and key" secret="antrea-controller-tls"
+I0816 13:49:55.143760       1 selfsignedcert_provider.go:260] "Generating self-signed cert"
+I0816 13:49:55.302301       1 selfsignedcert_provider.go:336] "Creating Secret to persist self-signed cert" secret=""
+I0816 13:49:55.307602       1 selfsignedcert_provider.go:276] "Writing certificate and key to the cert directory"
+I0816 13:49:55.543654       1 handler.go:275] Adding GroupVersion controlplane.antrea.io v1beta2 to ResourceManager
+I0816 13:49:55.544350       1 handler.go:275] Adding GroupVersion system.antrea.io v1beta1 to ResourceManager
