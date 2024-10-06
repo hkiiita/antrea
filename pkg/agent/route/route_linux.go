@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	utilnet "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
 
 	"antrea.io/antrea/pkg/agent/config"
 	"antrea.io/antrea/pkg/agent/openflow"
@@ -105,12 +106,15 @@ var (
 
 // Client takes care of routing container packets in host network, coordinating ip route, ip rule, iptables and ipset.
 type Client struct {
-	nodeConfig    *config.NodeConfig
-	networkConfig *config.NetworkConfig
-	noSNAT        bool
-	iptables      iptables.Interface
-	ipset         ipset.Interface
-	netlink       utilnetlink.Interface
+	nodeConfig             *config.NodeConfig
+	networkConfig          *config.NetworkConfig
+	noSNAT                 bool
+	nodeSNATRandomFully    bool
+	egressSNATRandomFully  bool
+	iptablesHasRandomFully bool
+	iptables               iptables.Interface
+	ipset                  ipset.Interface
+	netlink                utilnetlink.Interface
 	// nodeRoutes caches ip routes to remote Pods. It's a map of podCIDR to routes.
 	nodeRoutes sync.Map
 	// nodeNeighbors caches IPv6 Neighbors to remote host gateway
@@ -167,10 +171,14 @@ func NewClient(networkConfig *config.NetworkConfig,
 	connectUplinkToBridge bool,
 	nodeNetworkPolicyEnabled bool,
 	multicastEnabled bool,
+	nodeSNATRandomFully bool,
+	egressSNATRandomFully bool,
 	serviceCIDRProvider servicecidr.Interface) (*Client, error) {
 	return &Client{
 		networkConfig:               networkConfig,
 		noSNAT:                      noSNAT,
+		nodeSNATRandomFully:         nodeSNATRandomFully,
+		egressSNATRandomFully:       egressSNATRandomFully,
 		proxyAll:                    proxyAll,
 		multicastEnabled:            multicastEnabled,
 		connectUplinkToBridge:       connectUplinkToBridge,
@@ -205,6 +213,11 @@ func (c *Client) Initialize(nodeConfig *config.NodeConfig, done func()) error {
 	if err != nil {
 		return fmt.Errorf("error creating IPTables instance: %v", err)
 	}
+	c.iptablesHasRandomFully = c.iptables.HasRandomFully()
+	if (c.nodeSNATRandomFully || c.egressSNATRandomFully) && !c.iptablesHasRandomFully {
+		return fmt.Errorf("iptables does not support --random-fully for SNAT / MASQUERADE rules")
+	}
+
 	// Sets up the iptables infrastructure required to route packets in host network.
 	// It's called in a goroutine because xtables lock may not be acquired immediately.
 	go func() {
@@ -968,22 +981,30 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet,
 	// Egress rules must be inserted before the default masquerade rule.
 	for snatMark, snatIP := range snatMarkToIP {
 		// Cannot reuse snatRuleSpec to generate the rule as it doesn't have "`" in the comment.
-		writeLine(iptablesData, []string{
+		rule := []string{
 			"-A", antreaPostRoutingChain,
 			"-m", "comment", "--comment", `"Antrea: SNAT Pod to external packets"`,
 			"!", "-o", c.nodeConfig.GatewayConfig.Name,
 			"-m", "mark", "--mark", fmt.Sprintf("%#08x/%#08x", snatMark, types.SNATIPMarkMask),
 			"-j", iptables.SNATTarget, "--to", snatIP.String(),
-		}...)
+		}
+		if c.egressSNATRandomFully {
+			rule = append(rule, "--random-fully")
+		}
+		writeLine(iptablesData, rule...)
 	}
 	if !c.noSNAT {
-		writeLine(iptablesData, []string{
+		rule := []string{
 			"-A", antreaPostRoutingChain,
 			"-m", "comment", "--comment", `"Antrea: masquerade Pod to external packets"`,
 			"-s", podCIDR.String(), "-m", "set", "!", "--match-set", podIPSet, "dst",
 			"!", "-o", c.nodeConfig.GatewayConfig.Name,
 			"-j", iptables.MasqueradeTarget,
-		}...)
+		}
+		if c.nodeSNATRandomFully {
+			rule = append(rule, "--random-fully")
+		}
+		writeLine(iptablesData, rule...)
 	}
 
 	// For local traffic going out of the gateway interface, if the source IP does not match any
@@ -991,14 +1012,18 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet,
 	// that ARP requests may advertise a different source IP address, in which case they will be
 	// dropped by the SpoofGuard table in the OVS pipeline. See description for the arp_announce
 	// sysctl parameter.
-	writeLine(iptablesData, []string{
+	rule := []string{
 		"-A", antreaPostRoutingChain,
 		"-m", "comment", "--comment", `"Antrea: masquerade LOCAL traffic"`,
 		"-o", c.nodeConfig.GatewayConfig.Name,
 		"-m", "addrtype", "!", "--src-type", "LOCAL", "--limit-iface-out",
 		"-m", "addrtype", "--src-type", "LOCAL",
-		"-j", iptables.MasqueradeTarget, "--random-fully",
-	}...)
+		"-j", iptables.MasqueradeTarget,
+	}
+	if c.iptablesHasRandomFully {
+		rule = append(rule, "--random-fully")
+	}
+	writeLine(iptablesData, rule...)
 
 	// If AntreaProxy full support is enabled, it SNATs the packets whose source IP is VirtualServiceIPv4/VirtualServiceIPv6
 	// so the packets can be routed back to this Node.
@@ -1030,6 +1055,8 @@ func (c *Client) restoreIptablesData(podCIDR *net.IPNet,
 	//   01. AntreaIPAM VLAN Pod      -- hostPort [request]              --> AntreaIPAM VLAN Pod (same subnet)
 	//   02. Regular Pod (local)      -- hostPort [request]              --> AntreaIPAM VLAN Pod
 	if c.connectUplinkToBridge {
+		// We do not use --random-fully for this rule for consistency with the portmap CNI plugin.
+		// https://github.com/containernetworking/plugins/blob/c29dc79f96cd50452a247a4591443d2aac033429/plugins/meta/portmap/portmap.go#L321-L345
 		writeLine(iptablesData, []string{
 			"-A", antreaPostRoutingChain,
 			"-m", "comment", "--comment", `"Antrea: masquerade traffic to local AntreaIPAM hostPort Pod"`,
@@ -1584,7 +1611,7 @@ func (c *Client) UnMigrateRoutesFromGw(route *net.IPNet, linkName string) error 
 }
 
 func (c *Client) snatRuleSpec(snatIP net.IP, snatMark uint32) []string {
-	return []string{
+	rule := []string{
 		"-m", "comment", "--comment", "Antrea: SNAT Pod to external packets",
 		// The condition is needed to prevent the rule from being applied to local out packets destined for Pods, which
 		// have "0x1/0x1" mark.
@@ -1592,6 +1619,10 @@ func (c *Client) snatRuleSpec(snatIP net.IP, snatMark uint32) []string {
 		"-m", "mark", "--mark", fmt.Sprintf("%#08x/%#08x", snatMark, types.SNATIPMarkMask),
 		"-j", iptables.SNATTarget, "--to", snatIP.String(),
 	}
+	if c.egressSNATRandomFully {
+		rule = append(rule, "--random-fully")
+	}
+	return rule
 }
 
 func (c *Client) AddSNATRule(snatIP net.IP, mark uint32) error {
@@ -1679,8 +1710,8 @@ func (c *Client) DeleteEgressRoutes(tableID uint32) error {
 func (c *Client) AddEgressRule(tableID uint32, mark uint32) error {
 	rule := netlink.NewRule()
 	rule.Table = int(tableID)
-	rule.Mark = int(mark)
-	rule.Mask = int(types.SNATIPMarkMask)
+	rule.Mark = mark
+	rule.Mask = ptr.To(types.SNATIPMarkMask)
 	if err := c.netlink.RuleAdd(rule); err != nil {
 		return fmt.Errorf("error adding ip rule %v: %w", rule, err)
 	}
@@ -1690,8 +1721,8 @@ func (c *Client) AddEgressRule(tableID uint32, mark uint32) error {
 func (c *Client) DeleteEgressRule(tableID uint32, mark uint32) error {
 	rule := netlink.NewRule()
 	rule.Table = int(tableID)
-	rule.Mark = int(mark)
-	rule.Mask = int(types.SNATIPMarkMask)
+	rule.Mark = mark
+	rule.Mask = ptr.To(types.SNATIPMarkMask)
 	if err := c.netlink.RuleDel(rule); err != nil {
 		if err.Error() != "no such process" {
 			return fmt.Errorf("error deleting ip rule %v: %w", rule, err)
@@ -2068,7 +2099,7 @@ func (c *Client) DeleteRouteForLink(cidr *net.IPNet, linkIndex int) error {
 
 func (c *Client) ClearConntrackEntryForService(svcIP net.IP, svcPort uint16, endpointIP net.IP, protocol binding.Protocol) error {
 	var protoVar uint8
-	var ipFamilyVar int
+	var ipFamilyVar uint8
 	var zone uint16
 	switch protocol {
 	case binding.ProtocolTCP:

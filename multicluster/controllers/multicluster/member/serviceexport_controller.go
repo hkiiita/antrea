@@ -505,6 +505,7 @@ func (r *ServiceExportReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.endpointSliceEnabled {
 		return ctrl.NewControllerManagedBy(mgr).
 			For(&k8smcsv1alpha1.ServiceExport{}, versionChangePredicates).
+			Named("serviceexport").
 			Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(objectMapFunc), versionChangePredicates).
 			Watches(&discovery.EndpointSlice{}, handler.EnqueueRequestsFromMapFunc(endpointSliceMapFunc), versionChangePredicates).
 			Watches(&mcv1alpha2.ClusterSet{}, handler.EnqueueRequestsFromMapFunc(r.clusterSetMapFunc),
@@ -516,6 +517,7 @@ func (r *ServiceExportReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&k8smcsv1alpha1.ServiceExport{}, versionChangePredicates).
+		Named("serviceexport").
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(objectMapFunc), versionChangePredicates).
 		Watches(&corev1.Endpoints{}, handler.EnqueueRequestsFromMapFunc(objectMapFunc), versionChangePredicates).
 		Watches(&mcv1alpha2.ClusterSet{}, handler.EnqueueRequestsFromMapFunc(r.clusterSetMapFunc),
@@ -540,7 +542,8 @@ func (r *ServiceExportReconciler) clusterSetMapFunc(ctx context.Context, a clien
 		if len(clusterSet.Status.Conditions) > 0 && clusterSet.Status.Conditions[0].Status == corev1.ConditionTrue {
 			svcExports := &k8smcsv1alpha1.ServiceExportList{}
 			r.Client.List(ctx, svcExports)
-			for _, svcExport := range svcExports.Items {
+			for idx := range svcExports.Items {
+				svcExport := &svcExports.Items[idx]
 				namespacedName := types.NamespacedName{
 					Name:      svcExport.GetName(),
 					Namespace: svcExport.GetNamespace(),

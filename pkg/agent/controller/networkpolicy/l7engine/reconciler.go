@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,12 +33,13 @@ import (
 
 	"antrea.io/antrea/pkg/agent/config"
 	v1beta "antrea.io/antrea/pkg/apis/controlplane/v1beta2"
+	"antrea.io/antrea/pkg/util/logdir"
 )
 
 const (
 	defaultSuricataConfigPath = "/etc/suricata/suricata.yaml"
 	antreaSuricataConfigPath  = "/etc/suricata/antrea.yaml"
-	antreaSuricataLogPath     = "/var/log/antrea/networkpolicy/l7engine/"
+	antreaSuricataLogSubdir   = "networkpolicy/l7engine"
 
 	tenantConfigsDir = "/etc/suricata"
 	tenantRulesDir   = "/etc/suricata/rules"
@@ -76,10 +78,9 @@ outputs:
         enabled: no
       types:
         - alert:
-            tagged-packets: yes
+            packet: yes
         - http:
             extended: yes
-            tagged-packets: yes
         - tls:
             extended: yes
   - eve-log:
@@ -121,27 +122,27 @@ multi-detect:
 `, config.L7SuricataSocketPath, config.L7RedirectTargetPortName, config.L7RedirectReturnPortName)
 )
 
-type threadSafeInt32Set struct {
+type threadSafeSet[T comparable] struct {
 	sync.RWMutex
-	cached sets.Set[int32]
+	cached sets.Set[T]
 }
 
-func (g *threadSafeInt32Set) has(key uint32) bool {
+func (g *threadSafeSet[T]) has(key T) bool {
 	g.RLock()
 	defer g.RUnlock()
-	return g.cached.Has(int32(key))
+	return g.cached.Has(key)
 }
 
-func (g *threadSafeInt32Set) insert(key uint32) {
+func (g *threadSafeSet[T]) insert(key T) {
 	g.Lock()
 	defer g.Unlock()
-	g.cached.Insert(int32(key))
+	g.cached.Insert(key)
 }
 
-func (g *threadSafeInt32Set) delete(key uint32) {
+func (g *threadSafeSet[T]) delete(key T) {
 	g.Lock()
 	defer g.Unlock()
-	g.cached.Delete(int32(key))
+	g.cached.Delete(key)
 }
 
 type Reconciler struct {
@@ -149,8 +150,8 @@ type Reconciler struct {
 	startSuricataFn func()
 	suricataScFn    func(scCmd string) (*scCmdRet, error)
 
-	suricataTenantCache        *threadSafeInt32Set
-	suricataTenantHandlerCache *threadSafeInt32Set
+	suricataTenantCache        *threadSafeSet[uint32]
+	suricataTenantHandlerCache *threadSafeSet[uint32]
 
 	once sync.Once
 }
@@ -159,28 +160,21 @@ func NewReconciler() *Reconciler {
 	return &Reconciler{
 		suricataScFn:    suricataSc,
 		startSuricataFn: startSuricata,
-		suricataTenantCache: &threadSafeInt32Set{
-			cached: sets.New[int32](),
+		suricataTenantCache: &threadSafeSet[uint32]{
+			cached: sets.New[uint32](),
 		},
-		suricataTenantHandlerCache: &threadSafeInt32Set{
-			cached: sets.New[int32](),
+		suricataTenantHandlerCache: &threadSafeSet[uint32]{
+			cached: sets.New[uint32](),
 		},
 	}
 }
 
-func generateTenantRulesData(policyName string, protoKeywords map[string]sets.Set[string], enableLogging bool) *bytes.Buffer {
+func generateTenantRulesData(policyName string, protoKeywords map[string]sets.Set[string]) *bytes.Buffer {
 	rulesData := bytes.NewBuffer(nil)
 	sid := 1
 
-	// Enable logging of packets in the session that set off the rule, the session is tagged for 30 seconds.
-	// Refer to Suricata detect engine in codebase for detailed tag keyword configuration.
-	var tagKeyword string
-	if enableLogging {
-		tagKeyword = " tag: session, 30, seconds;"
-	}
-
 	// Generate default reject rule.
-	allKeywords := fmt.Sprintf(`msg: "Reject by %s"; flow: to_server, established;%s sid: %d;`, policyName, tagKeyword, sid)
+	allKeywords := fmt.Sprintf(`msg: "Reject by %s"; flow: to_server, established; sid: %d;`, policyName, sid)
 	rule := fmt.Sprintf("reject ip any any -> any any (%s)\n", allKeywords)
 	rulesData.WriteString(rule)
 	sid++
@@ -191,9 +185,9 @@ func generateTenantRulesData(policyName string, protoKeywords map[string]sets.Se
 			// It is a convention that the sid is provided as the last keyword (or second-to-last if there is a rev)
 			// of a rule.
 			if keywords != "" {
-				allKeywords = fmt.Sprintf(`msg: "Allow %s by %s"; %s%s sid: %d;`, proto, policyName, keywords, tagKeyword, sid)
+				allKeywords = fmt.Sprintf(`msg: "Allow %s by %s"; %s sid: %d;`, proto, policyName, keywords, sid)
 			} else {
-				allKeywords = fmt.Sprintf(`msg: "Allow %s by %s";%s sid: %d;`, proto, policyName, tagKeyword, sid)
+				allKeywords = fmt.Sprintf(`msg: "Allow %s by %s"; sid: %d;`, proto, policyName, sid)
 			}
 			rule = fmt.Sprintf("pass %s any any -> any any (%s)\n", proto, allKeywords)
 			rulesData.WriteString(rule)
@@ -272,7 +266,7 @@ func (r *Reconciler) StartSuricataOnce() {
 	})
 }
 
-func (r *Reconciler) AddRule(ruleID, policyName string, vlanID uint32, l7Protocols []v1beta.L7Protocol, enableLogging bool) error {
+func (r *Reconciler) AddRule(ruleID, policyName string, vlanID uint32, l7Protocols []v1beta.L7Protocol) error {
 	start := time.Now()
 	defer func() {
 		klog.V(5).Infof("AddRule took %v", time.Since(start))
@@ -302,7 +296,7 @@ func (r *Reconciler) AddRule(ruleID, policyName string, vlanID uint32, l7Protoco
 	klog.InfoS("Reconciling L7 rule", "RuleID", ruleID, "PolicyName", policyName)
 	// Write the Suricata rules to file.
 	rulesPath := generateTenantRulesPath(vlanID)
-	rulesData := generateTenantRulesData(policyName, protoKeywords, enableLogging)
+	rulesData := generateTenantRulesData(policyName, protoKeywords)
 	if err := writeConfigFile(rulesPath, rulesData); err != nil {
 		return fmt.Errorf("failed to write Suricata rules data to file %s for L7 rule %s of %s, err: %w", rulesPath, ruleID, policyName, err)
 	}
@@ -360,10 +354,10 @@ func (r *Reconciler) addBindingSuricataTenant(vlanID uint32, rulesPath string) e
 	tenantConfigData := bytes.NewBuffer([]byte(fmt.Sprintf(`%%YAML 1.1
 
 ---
-default-rule-path: /etc/suricata/rules
+default-rule-path: %s
 rule-files:
   - %s
-`, rulesPath)))
+`, tenantRulesDir, rulesPath)))
 	if err = writeConfigFile(tenantConfigPath, tenantConfigData); err != nil {
 		return fmt.Errorf("failed to write config file %s for Suricata tenant %d: %w", tenantConfigPath, vlanID, err)
 	}
@@ -509,9 +503,14 @@ func (r *Reconciler) startSuricata() {
 }
 
 func startSuricata() {
-	// Create log directory /var/log/antrea/networkpolicy/l7engine/ for Suricata.
-	if err := os.Mkdir(antreaSuricataLogPath, os.ModePerm); err != nil {
-		klog.ErrorS(err, "Failed to create L7 Network Policy log directory", "Directory", antreaSuricataLogPath)
+	// Ensure that rules directory exists.
+	if err := os.MkdirAll(tenantRulesDir, 0755); err != nil {
+		klog.ErrorS(err, "Failed to create Suricata rule directory", "directory", tenantRulesDir)
+	}
+	// Create log directory for Suricata.
+	antreaSuricataLogPath := filepath.Join(logdir.GetLogDir(), antreaSuricataLogSubdir)
+	if err := os.MkdirAll(antreaSuricataLogPath, 0755); err != nil {
+		klog.ErrorS(err, "Failed to create L7 Network Policy log directory", "directory", antreaSuricataLogPath)
 	}
 	// Start Suricata with default Suricata config file /etc/suricata/suricata.yaml.
 	cmd := exec.Command("suricata", "-c", defaultSuricataConfigPath, "--af-packet", "-D", "-l", antreaSuricataLogPath)

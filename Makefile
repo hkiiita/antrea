@@ -23,7 +23,7 @@ GIT_HOOKS          := $(shell find hack/git_client_side_hooks -type f -print)
 DOCKER_NETWORK     ?= default
 TRIVY_TARGET_IMAGE ?=
 
-GOLANGCI_LINT_VERSION := v1.54.0
+GOLANGCI_LINT_VERSION := v1.60.3
 GOLANGCI_LINT_BINDIR  := $(CURDIR)/.golangci-bin
 GOLANGCI_LINT_BIN     := $(GOLANGCI_LINT_BINDIR)/$(GOLANGCI_LINT_VERSION)/golangci-lint
 
@@ -258,7 +258,7 @@ $(ANTCTL_BINARIES): antctl-%:
 	fi
 
 .PHONY: antctl
-antctl: $(ANTCTL_BINARIES)
+antctl: antctl-release
 
 .PHONY: antctl-release
 antctl-release:

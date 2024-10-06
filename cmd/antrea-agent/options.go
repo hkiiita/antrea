@@ -494,6 +494,11 @@ func (o *Options) setK8sNodeDefaultOptions() {
 			o.config.Egress.MaxEgressIPsPerNode = defaultMaxEgressIPsPerNode
 		}
 	}
+
+	// Regardless of whether the egress feature is enabled, o.config.Egress.SNATFullyRandomPorts should not be nil to prevent a crash in NewClient().
+	if o.config.Egress.SNATFullyRandomPorts == nil {
+		o.config.Egress.SNATFullyRandomPorts = ptr.To(o.config.SNATFullyRandomPorts)
+	}
 }
 
 func (o *Options) validateEgressConfig(encapMode config.TrafficEncapModeType) error {

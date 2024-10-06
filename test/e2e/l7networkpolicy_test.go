@@ -15,11 +15,13 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"path"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -359,13 +361,21 @@ func testL7NetworkPolicyLogging(t *testing.T, data *TestData) {
 	require.NoError(t, err, "Expected IP for Pod '%s'", serverPodName)
 	serverIPs := podIPs.AsSlice()
 
-	// Filename base on generated Suricata config https://github.com/antrea-io/antrea/blob/main/pkg/agent/controller/networkpolicy/l7engine/reconciler.go.
-	l7LogFile := path.Join(logDir, "l7engine", fmt.Sprintf("eve-%s.json", time.Now().Format(time.DateOnly)))
-
 	antreaPodName, err := data.getAntreaPodOnNode(l7LoggingNode)
 	require.NoError(t, err, "Error occurred when trying to get the antrea-agent Pod running on Node %s", l7LoggingNode)
+
+	// Find filename of L7 log file.
+	// Filename is determined by generated Suricata config https://github.com/antrea-io/antrea/blob/main/pkg/agent/controller/networkpolicy/l7engine/reconciler.go.
+	stdout, _, err := data.RunCommandFromPod(antreaNamespace, antreaPodName, "antrea-agent", []string{"find", "/var/log/antrea/networkpolicy/l7engine/", "-regex", `.*\/eve\-.*\.json`})
+	require.NoError(t, err)
+	l7LogFiles := strings.Fields(stdout)
+	require.NotEmpty(t, l7LogFiles, "L7 log file is missing")
+	// In case there is more than one file, take the latest (date is encoded in filename).
+	slices.Sort(l7LogFiles)
+	l7LogFile := l7LogFiles[len(l7LogFiles)-1]
+
 	// Truncate existing log file if applicable to avoid interference between test runs.
-	// Note that the file cannot simply be removed, as Suricata will not recreate it. See https://docs.suricata.io/en/suricata-6.0.0/output/log-rotation.html.
+	// Note that the file cannot simply be removed, as Suricata will not recreate it. See https://docs.suricata.io/en/suricata-7.0.0/output/log-rotation.html.
 	_, _, err = data.RunCommandFromPod(antreaNamespace, antreaPodName, "antrea-agent", []string{"truncate", "-c", "-s", "0", l7LogFile})
 	require.NoError(t, err)
 
@@ -385,10 +395,27 @@ func testL7NetworkPolicyLogging(t *testing.T, data *TestData) {
 	probeL7NetworkPolicyHTTP(t, data, serverPodName, clientPodName, serverIPs, true, false)
 
 	// Define log matchers for expected L7 NetworkPolicies log entries.
-	var l7LogMatchers []L7LogEntry
+	var l7LogMatchers []*L7LogEntry
 	for _, ip := range serverIPs {
-		clientMatcher := L7LogEntry{EventType: "alert", Protocol: "TCP", Http: L7LogHttpEntry{Hostname: ip.String(), Port: 8080, Url: "/clientip"}}
-		hostMatcher := L7LogEntry{EventType: "http", Protocol: "TCP", Http: L7LogHttpEntry{Hostname: ip.String(), Port: 8080, Url: "/hostname"}}
+		clientMatcher := &L7LogEntry{
+			EventType:           "alert",
+			DestIP:              ip.String(),
+			DestPort:            8080,
+			Protocol:            "TCP",
+			AppProtocol:         "http",
+			expectedPacketRegex: regexp.MustCompile(fmt.Sprintf("%s|HTTP|GET|%s", ip.String(), "/clientip")),
+			Alert: &L7LogAlertEntry{
+				Action:    "blocked",
+				Signature: fmt.Sprintf("Reject by AntreaNetworkPolicy:%s/%s", data.testNamespace, policyAllowPathHostname),
+			},
+		}
+		hostMatcher := &L7LogEntry{
+			EventType: "http",
+			DestIP:    ip.String(),
+			DestPort:  8080,
+			Protocol:  "TCP",
+			Http:      &L7LogHttpEntry{Hostname: ip.String(), Port: 8080, Url: "/hostname"},
+		}
 		l7LogMatchers = append(l7LogMatchers, clientMatcher, hostMatcher)
 	}
 
@@ -402,13 +429,58 @@ type L7LogHttpEntry struct {
 	Url      string `json:"url"`
 }
 
-type L7LogEntry struct {
-	EventType string         `json:"event_type"`
-	Protocol  string         `json:"proto"`
-	Http      L7LogHttpEntry `json:"http"`
+type L7LogAlertEntry struct {
+	Action    string `json:"action"`
+	Signature string `json:"signature"`
 }
 
-func checkL7LoggingResult(t *testing.T, data *TestData, antreaPodName string, l7LogFile string, expected []L7LogEntry) {
+type L7LogEntry struct {
+	EventType           string           `json:"event_type"`
+	DestIP              string           `json:"dest_ip"`
+	DestPort            int32            `json:"dest_port"`
+	Protocol            string           `json:"proto"`
+	AppProtocol         string           `json:"app_proto,omitempty"`
+	PacketBytes         []byte           `json:"packet,omitempty"`
+	Http                *L7LogHttpEntry  `json:"http,omitempty"`
+	Alert               *L7LogAlertEntry `json:"alert,omitempty"`
+	expectedPacketRegex *regexp.Regexp
+}
+
+// Matches the 2 L7LogEntries. If an L7LogEntry includes an expectedPacketRegex, the
+// PacketBytes field in the other L7LogEntry must match the regex. If none of the
+// L7LogEntries include an expectedPacketRegex, the PacketBytes fields must be
+// strictly equal for both entries.
+func (e *L7LogEntry) Match(x *L7LogEntry) bool {
+	packetMatch := func(e, x *L7LogEntry) bool {
+		if e.expectedPacketRegex != nil {
+			if !e.expectedPacketRegex.Match(x.PacketBytes) {
+				return false
+			}
+		}
+		if x.expectedPacketRegex != nil {
+			if !x.expectedPacketRegex.Match(e.PacketBytes) {
+				return false
+			}
+		}
+		if e.expectedPacketRegex == nil && x.expectedPacketRegex == nil {
+			if !bytes.Equal(e.PacketBytes, x.PacketBytes) {
+				return false
+			}
+		}
+		return true
+	}
+
+	return e.EventType == x.EventType && e.DestIP == x.DestIP && e.DestPort == x.DestPort &&
+		e.Protocol == x.Protocol && e.AppProtocol == x.AppProtocol && packetMatch(e, x) &&
+		reflect.DeepEqual(e.Http, x.Http) && reflect.DeepEqual(e.Alert, x.Alert)
+}
+
+func (e *L7LogEntry) String() string {
+	b, _ := json.Marshal(e)
+	return string(b)
+}
+
+func checkL7LoggingResult(t *testing.T, data *TestData, antreaPodName string, l7LogFile string, expected []*L7LogEntry) {
 	cmd := []string{"cat", l7LogFile}
 
 	t.Logf("Checking L7NP logs on Pod '%s'", antreaPodName)
@@ -421,20 +493,20 @@ func checkL7LoggingResult(t *testing.T, data *TestData, antreaPodName string, l7
 			return false, nil
 		}
 
-		var actual []L7LogEntry
+		var actual []*L7LogEntry
 		dec := json.NewDecoder(strings.NewReader(stdout))
 		for dec.More() {
-			var log L7LogEntry
-			if err := dec.Decode(&log); err != nil {
+			log := &L7LogEntry{}
+			if err := dec.Decode(log); err != nil {
 				// log format error, fail immediately
 				return false, err
 			}
 			// ignore unexpected log entries and duplicates
-			if slices.Contains(expected, log) && !slices.Contains(actual, log) {
+			if slices.ContainsFunc(expected, log.Match) && !slices.ContainsFunc(actual, log.Match) {
 				actual = append(actual, log)
 			}
 		}
-		if !slices.Equal(actual, expected) {
+		if !slices.EqualFunc(actual, expected, func(e1, e2 *L7LogEntry) bool { return e1.Match(e2) }) {
 			t.Logf("L7NP log mismatch")
 			t.Logf("Expected: %v", expected)
 			t.Logf("Actual: %v", actual)

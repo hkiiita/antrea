@@ -49,27 +49,25 @@ import (
 // LabelIdentityReconciler watches relevant Pod and Namespace events in the member cluster,
 // computes the label identities added to and deleted from the cluster, and exports them to the
 // leader cluster for further processing.
-type (
-	LabelIdentityReconciler struct {
-		client.Client
-		Scheme           *runtime.Scheme
-		commonAreaMutex  sync.Mutex
-		commonAreaGetter commonarea.RemoteCommonAreaGetter
-		remoteCommonArea commonarea.RemoteCommonArea
-		namespace        string
-		// labelMutex prevents concurrent access to labelToPodsCache and podLabelCache.
-		// It also prevents concurrent updates to labelExportUpdatesInProgress.
-		labelMutex sync.RWMutex
-		// labelToPodsCache stores mapping from label identities to Pods that have this label identity.
-		labelToPodsCache map[string]sets.Set[string]
-		// podLabelCache stores mapping from Pods to their label identities.
-		podLabelCache map[string]string
-		// labelQueue maintains the normalized labels whose corresponding ResourceExport objects are
-		// determined to be created/deleted by the reconciler.
-		labelQueue     workqueue.RateLimitingInterface
-		localClusterID string
-	}
-)
+type LabelIdentityReconciler struct {
+	client.Client
+	Scheme           *runtime.Scheme
+	commonAreaMutex  sync.Mutex
+	commonAreaGetter commonarea.RemoteCommonAreaGetter
+	remoteCommonArea commonarea.RemoteCommonArea
+	namespace        string
+	// labelMutex prevents concurrent access to labelToPodsCache and podLabelCache.
+	// It also prevents concurrent updates to labelExportUpdatesInProgress.
+	labelMutex sync.RWMutex
+	// labelToPodsCache stores mapping from label identities to Pods that have this label identity.
+	labelToPodsCache map[string]sets.Set[string]
+	// podLabelCache stores mapping from Pods to their label identities.
+	podLabelCache map[string]string
+	// labelQueue maintains the normalized labels whose corresponding ResourceExport objects are
+	// determined to be created/deleted by the reconciler.
+	labelQueue     workqueue.TypedRateLimitingInterface[string]
+	localClusterID string
+}
 
 func NewLabelIdentityReconciler(
 	client client.Client,
@@ -83,7 +81,7 @@ func NewLabelIdentityReconciler(
 		commonAreaGetter: commonAreaGetter,
 		labelToPodsCache: map[string]sets.Set[string]{},
 		podLabelCache:    map[string]string{},
-		labelQueue:       workqueue.NewRateLimitingQueue(workqueue.DefaultItemBasedRateLimiter()),
+		labelQueue:       workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedItemBasedRateLimiter[string]()),
 	}
 }
 
@@ -134,6 +132,7 @@ func (r *LabelIdentityReconciler) checkRemoteCommonArea() bool {
 func (r *LabelIdentityReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1.Pod{}, builder.WithPredicates(predicate.LabelChangedPredicate{})).
+		Named("labelidentity").
 		Watches(&v1.Namespace{},
 			handler.EnqueueRequestsFromMapFunc(r.namespaceMapFunc),
 			builder.WithPredicates(predicate.LabelChangedPredicate{})).
@@ -158,12 +157,13 @@ func (r *LabelIdentityReconciler) clusterSetMapFunc(ctx context.Context, a clien
 			podList := &v1.PodList{}
 			r.Client.List(ctx, podList)
 			requests = make([]reconcile.Request, len(podList.Items))
-			for i, pod := range podList.Items {
+			for idx := range podList.Items {
+				pod := &podList.Items[idx]
 				podNamespacedName := types.NamespacedName{
 					Name:      pod.GetName(),
 					Namespace: pod.GetNamespace(),
 				}
-				requests[i] = reconcile.Request{
+				requests[idx] = reconcile.Request{
 					NamespacedName: podNamespacedName,
 				}
 			}
@@ -183,8 +183,9 @@ func (r *LabelIdentityReconciler) namespaceMapFunc(ctx context.Context, ns clien
 	podList := &v1.PodList{}
 	r.Client.List(context.TODO(), podList, client.InNamespace(ns.GetName()))
 	requests := make([]reconcile.Request, len(podList.Items))
-	for i, pod := range podList.Items {
-		requests[i] = reconcile.Request{
+	for idx := range podList.Items {
+		pod := &podList.Items[idx]
+		requests[idx] = reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Name:      pod.GetName(),
 				Namespace: pod.GetNamespace(),
@@ -271,8 +272,7 @@ func (r *LabelIdentityReconciler) processLabelForResourceExport() bool {
 		return false
 	}
 	defer r.labelQueue.Done(key)
-	err := r.syncLabelResourceExport(key.(string))
-	if err != nil {
+	if err := r.syncLabelResourceExport(key); err != nil {
 		// Put the item back on the workqueue to handle any transient errors.
 		r.labelQueue.AddRateLimited(key)
 		klog.ErrorS(err, "Failed to sync ResourceExport for label identity", "label", key)

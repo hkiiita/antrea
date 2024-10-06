@@ -187,8 +187,7 @@ func (c *NetworkPolicyController) processNextInternalGroupWorkItem() bool {
 	}
 	defer c.internalGroupQueue.Done(key)
 
-	err := c.syncInternalGroup(key.(string))
-	if err != nil {
+	if err := c.syncInternalGroup(key); err != nil {
 		// Put the item back in the workqueue to handle any transient errors.
 		c.internalGroupQueue.AddRateLimited(key)
 		klog.Errorf("Failed to sync internal Group %s: %v", key, err)
@@ -439,7 +438,8 @@ func (c *NetworkPolicyController) GetAssociatedIPBlockGroups(ip net.IP) []antrea
 	var matchedGroups []antreatypes.Group
 	for _, obj := range ipBlockGroupObjs {
 		group := obj.(*antreatypes.Group)
-		for _, ipNet := range group.IPNets {
+		for idx := range group.IPNets {
+			ipNet := &group.IPNets[idx]
 			if ipNet.Contains(ip) {
 				matchedGroups = append(matchedGroups, *group)
 				// Append all parent groups to matchedGroups
